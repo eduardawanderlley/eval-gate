@@ -1,0 +1,13 @@
+services:
+  eval:
+    build: .
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - EVAL_MODEL=${EVAL_MODEL:-claude-haiku-5-5}
+      - EVAL_JUDGE_MODEL=${EVAL_JUDGE_MODEL:-claude-haiku-5-5}
+      - EVAL_PRICE_INPUT_PER_MTOK=${EVAL_PRICE_INPUT_PER_MTOK:-0}
+      - EVAL_PRICE_OUTPUT_PER_MTOK=${EVAL_PRICE_OUTPUT_PER_MTOK:-0}
+    volumes:
+      # Cache e resultados ficam no host, para não repetir chamadas entre execuções.
+      - ./.cache:/app/.cache
+      - ./results:/app/results

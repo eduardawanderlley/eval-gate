@@ -1,0 +1,16 @@
+# Pisos absolutos e tolerância de regressão do Eval Gate.
+#
+# Os valores iniciais são conservadores. Calibre-os com a primeira execução
+# real na main: o piso deve ficar um pouco abaixo do resultado atual, para
+# não bloquear ruído, e nunca deve ser rebaixado só para destravar um PR.
+floors:
+  faithfulness: 0.80
+  answer_relevance: 0.70
+  context_precision: 0.50
+  refusal_accuracy: 0.85
+
+max_regression:
+  faithfulness: 0.03
+  answer_relevance: 0.05
+  context_precision: 0.05
+  refusal_accuracy: 0.03

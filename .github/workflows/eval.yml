@@ -1,0 +1,76 @@
+name: Eval Gate
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: make install
+      - run: make test
+
+  eval:
+    needs: test
+    runs-on: ubuntu-latest
+    # Pull requests vindos de forks não recebem secrets, então a avaliação não roda neles.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: make install
+
+      # A chave do cache é a própria chave de cada chamada (hash do prompt), então
+      # restaurar a última versão é sempre seguro: prompts alterados geram cache miss.
+      - name: Restaura cache de respostas do LLM
+        uses: actions/cache@v4
+        with:
+          path: .cache/llm
+          key: llm-cache-${{ github.run_id }}
+          restore-keys: llm-cache-
+
+      - name: Executa avaliação e gate
+        id: gate
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EVAL_MODEL: claude-haiku-5-5
+          EVAL_JUDGE_MODEL: claude-haiku-5-5
+        run: make eval
+
+      - name: Publica relatório como comentário no PR
+        if: always() && hashFiles('results/report.md') != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- eval-gate -->';
+            const body = `${marker}\n${fs.readFileSync('results/report.md', 'utf8')}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            // Um único comentário por PR: atualizamos o existente em vez de empilhar.
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Falha o job se o gate reprovou
+        if: steps.gate.outcome == 'failure'
+        run: exit 1
