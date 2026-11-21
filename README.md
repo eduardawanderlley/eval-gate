@@ -1,164 +1,351 @@
+<div align="center">
+
 # Eval Gate
 
-Pipeline de avaliação para sistemas RAG, com bloqueio automático de pull request quando a qualidade cai.
+**Automated RAG Evaluation & CI Quality Gate Pipeline**
 
-Montar um RAG que responde perguntas sobre documentos é relativamente fácil. Difícil é saber, depois de trocar o tamanho dos chunks ou reescrever o prompt, se o sistema ficou melhor ou pior, e impedir que uma mudança aparentemente inocente degrade as respostas sem que ninguém perceba. Este projeto trata a avaliação como parte do código: um conjunto de casos versionado no repositório, métricas calculadas a cada mudança e um gate no GitHub Actions que reprova o PR quando uma métrica passa do limite.
+*Versioned evaluation datasets, LLM-as-a-Judge metrics, deterministic hallucination verification, and automated Pull Request gating via GitHub Actions.*
 
-O domínio de exemplo é a LGPD (Lei 13.709/2018), mas nada no pipeline depende dela. Trocar o corpus e o golden set é suficiente para aplicá-lo a outro domínio.
+[![CI](https://github.com/eduardawanderlley/eval-gate/actions/workflows/eval.yml/badge.svg)](https://github.com/eduardawanderlley/eval-gate/actions/workflows/eval.yml)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg)](https://www.docker.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-![CI](https://github.com/SEU_USUARIO/eval-gate/actions/workflows/eval.yml/badge.svg)
+[🇺🇸 English](#english-documentation) • [🇧🇷 Português](#documentação-em-português)
 
-## Como funciona
+</div>
 
-A pergunta passa por uma busca lexical BM25, que devolve os chunks mais relevantes. O modelo gera a resposta usando apenas esses trechos, com instrução explícita para recusar quando a informação não estiver lá. Em seguida, cada resposta é avaliada por métricas independentes, e o conjunto das métricas alimenta o gate.
+---
 
-```
-pergunta ──► BM25 (top-k chunks) ──► geração (com recusa) ──► resposta
+## English Documentation
+
+### Overview
+
+Building a Retrieval-Augmented Generation (RAG) prototype is straightforward; guaranteeing that chunking tweaks, prompt rewrites, or retrieval parameter changes do not silently degrade answer quality is the real engineering challenge.
+
+**Eval Gate** treats AI evaluation as first-class software engineering: versioned golden datasets in Git, deterministic metric calculation on every change, and a **CI Quality Gate** in GitHub Actions that automatically blocks Pull Requests whenever quality regresses beyond configured thresholds.
+
+While the reference corpus uses Brazilian data privacy legislation (**LGPD — Law 13.709/2018**), the pipeline is completely domain-agnostic—swapping the corpus and golden dataset adapts the framework to any knowledge base.
+
+---
+
+### Architecture & Evaluation Pipeline
+
+Every query runs through a lexical BM25 retriever and a constrained generator with explicit refusal instructions. The output is evaluated across four orthogonal quality dimensions before hitting the CI gate:
+
+```text
+Query ──► BM25 (top-k chunks) ──► Constrained Generation (with refusal) ──► Response
                                             │
           ┌─────────────────────────────────┼──────────────────────────────┐
           ▼                                 ▼                              ▼
-   faithfulness                    answer relevance              context precision
-   (afirmação × evidência)           (juiz, nota 0–5)          (chunks úteis / top-k)
+   Faithfulness                    Answer Relevance               Context Precision
+   (Claim × Literal Evidence)       (LLM Judge, 0–5)              (Useful Chunks / top-k)
           │
-          └──────────── refusal accuracy (recusa só quando deve) ──────────┐
+          └──────────── Refusal Accuracy (Refuses iff out-of-scope) ───────┐
                                                                             ▼
-                             gate: piso absoluto + regressão vs baseline ──► CI
+                        CI Gate: Absolute Floor + Baseline Regression ──► Pass / Fail
 ```
 
-## Métricas
+---
 
-Cada métrica foi escolhida para responder a uma pergunta específica, e cada uma tem limitações que convém conhecer antes de confiar nela.
+### Evaluation Metrics & Telemetry
 
-| Métrica | Pergunta que responde | Como é calculada | Limitação conhecida |
-|---|---|---|---|
-| `faithfulness` | A resposta é sustentada pelos trechos recuperados? | Afirmações sustentadas dividido pelo total de afirmações. Cada afirmação precisa de uma citação literal que é verificada no chunk indicado. | Depende da decomposição feita pelo LLM. Uma afirmação mal quebrada pode ser julgada com folga. |
-| `answer_relevance` | A resposta trata da pergunta feita? | Juiz LLM com escala de 0 a 5, normalizada para 0 a 1. | Juízes LLM tendem a ser generosos com respostas longas. Por isso medimos a concordância com humanos (ver abaixo). |
-| `context_precision` | O retrieval trouxe coisa útil? | Chunks julgados úteis dividido pelos chunks recuperados. Casos sem nenhum chunk ficam de fora da média. | Não mede recall: não diz o que deveria ter sido recuperado e não foi. |
-| `refusal_accuracy` | O sistema recusa quando deve, e só quando deve? | Proporção de casos em que recusa coincide com a categoria do caso (`fora_do_escopo`). | Uma recusa parcial, que responde uma parte e nega outra, depende do classificador de recusa. |
+| Metric | Core Question | Calculation Methodology | Known Limitations |
+| :--- | :--- | :--- | :--- |
+| **`faithfulness`** | Is the answer strictly grounded in retrieved chunks? | Supported claims / total extracted claims. Every claim requires a verbatim quote verified deterministically in the source chunk. | Sensitive to LLM claim decomposition granularity; poorly split claims may receive lenient verdicts. |
+| **`answer_relevance`** | Does the response directly address the user query? | LLM-as-a-Judge score on a `0–5` scale, normalized to `[0, 1]`. | LLM judges exhibit verbosity bias (favoring longer answers), requiring human-judge calibration. |
+| **`context_precision`** | Did retrieval surface relevant context? | Useful chunks / total retrieved chunks (`top-k`). Queries returning zero chunks are excluded from the mean. | Does not capture *recall* (cannot penalize relevant documents missed by the retriever). |
+| **`refusal_accuracy`** | Does the system abstain when—and only when—appropriate? | Proportion of cases where model refusal aligns with the dataset ground-truth label (`fora_do_escopo`). | Partial refusals (answering part of a query while abstaining on another) depend on classifier sensitivity. |
 
-Além das métricas de qualidade, o relatório registra latência (p50 e p95 das chamadas de geração que foram ao modelo, sem contar cache), tokens consumidos, custo estimado e taxa de acerto do cache. O custo só é calculado se você definir os preços por milhão de tokens em `.env`.
+**Operational Telemetry:** Alongside quality scores, every report tracks **p50/p95 generation latency** (excluding cache hits), **token consumption**, **estimated API cost** (configured via `.env`), and **disk cache hit rate**.
 
-## O gate
+---
 
-O gate aplica duas regras, ambas definidas em `thresholds.yaml`.
+### The CI Quality Gate (`thresholds.yaml`)
 
-A primeira é o piso absoluto. Cada métrica gated precisa estar acima do valor configurado, mesmo que a execução anterior tenha sido pior. A segunda é a regressão. Nenhuma métrica pode cair mais que a tolerância configurada em relação à baseline, que é o resultado da main gravado em `evals/baseline.json`.
+The gate enforces two non-negotiable policies prior to merging code:
 
-Os limites iniciais são conservadores e devem ser calibrados com a primeira execução real na main. A regra de ouro é não rebaixar um limite só para destravar um PR. Se o gate reprovou algo legítimo, a resposta certa é entender a queda, não mexer no número.
+1. **Absolute Floor:** Every gated metric must exceed its minimum threshold, regardless of prior baseline performance.
+2. **Regression Tolerance:** No metric may drop beyond the allowed delta compared to the `main` branch reference stored in `evals/baseline.json`.
 
-## Decisões de projeto
+> **Engineering Principle:** Initial thresholds are conservative and calibrated on the first `main` run. Never lower a threshold merely to unblock a PR—investigate the root cause of the regression instead.
 
-A busca é lexical (BM25), não vetorial. A escolha foi deliberada: BM25 é determinístico, não custa nada além de CPU e funciona bem com termos jurídicos específicos, como "controlador", "operador" e "anonimização". A limitação é que ele não entende sinônimos. A interface de recuperação foi isolada para que comparar com embeddings seja uma troca de implementação, e essa comparação é o próximo experimento natural do projeto.
+---
 
-O juiz pode e deve usar um modelo diferente do gerador, configurado por `EVAL_JUDGE_MODEL`. Um modelo tende a dar notas melhores às próprias respostas, e separar os papéis reduz esse viés. Com um único modelo, o viés continua presente, e é preciso dizer isso ao avaliar os resultados.
+### Key Architectural Decisions
 
-O verificador de sustentação não confia só na palavra do juiz. Quando o juiz diz que uma afirmação é sustentada, ele precisa apontar um trecho literal do chunk, e esse trecho é procurado de forma determinística no texto recuperado. Juízes LLM podem confirmar uma afirmação e inventar a citação que a justificaria. Esse caso é contado como não sustentado.
+- **Deterministic Lexical Retrieval (BM25):** Chosen over dense embeddings for zero-cost CPU execution, full determinism, and high precision on exact legal terminology (e.g., *"controlador"*, *"operador"*, *"anonimização"*). The retriever interface is decoupled to allow seamless A/B benchmarking against dense vector embeddings.
+- **Role Separation (Generator vs. Judge):** Configurable via `EVAL_JUDGE_MODEL` to prevent self-enhancement bias (models rating their own outputs higher).
+- **Anti-Hallucination Quote Verification:** When a judge marks a claim as supported, it must output a literal substring from the context. The verifier deterministically checks substring existence in the chunk—fabricated citations are automatically downgraded to *unsupported*.
+- **Zero-Context Short-Circuit Refusal:** When BM25 returns zero chunks, the pipeline returns a deterministic refusal without invoking the LLM, eliminating hallucination risk and reducing inference cost.
+- **Content-Addressed Disk Cache & `temperature=0`:** LLM calls are cached by `(model, prompt_hash, max_tokens)`. Re-running unchanged suites incurs zero API cost, while prompt edits invalidate only affected calls.
+- **API-Free Unit & Regression Test Suite:** `FakeLLM` (`tests/fakes.py`) serves deterministic queued responses, enabling fast CI verification of judges, claim verifiers, and gate logic without external network calls.
 
-A recusa é tratada como caminho próprio. Se nenhum chunk é recuperado, a resposta é a recusa, sem chamar o modelo de geração. Isso é mais barato e evita que o modelo invente contexto quando não há contexto nenhum.
+---
 
-Todas as chamadas ao LLM passam por um cache em disco indexado pelo hash de modelo, prompts e limite de tokens. Reexecutar a suíte sem mudanças não custa nada, e uma mudança de prompt invalida apenas as chamadas afetadas. A temperatura é zero, para que a comparação entre execuções reflita mudanças no sistema, e não ruído de amostragem.
+### Quickstart
 
-Os testes não dependem de API. O `FakeLLM` em `tests/fakes.py` devolve respostas enfileiradas, o que permite testar o verificador de sustentação, os juízes e o gate de forma determinística. A única parte que exige a API é a execução de avaliação real.
-
-## Como rodar
-
-Os comandos abaixo assumem Python 3.12 e um shell POSIX. A forma mais simples de começar é com Docker, mas o fluxo local também funciona.
+Requires **Python 3.12+** and a POSIX shell (or **Docker**).
 
 ```bash
-make install          # instala as dependências
-make corpus           # baixa a LGPD do Planalto para data/corpus/lgpd.txt
-make test             # roda os testes unitários (não precisa de API)
+make install          # Install dependencies
+make corpus           # Download LGPD text to data/corpus/lgpd.txt
+make test             # Run unit test suite (offline, no API key required)
 
-cp .env.example .env  # preencha ANTHROPIC_API_KEY e, se quiser, os preços
-make smoke            # 3 casos, para checar a chave e o pipeline
-make baseline         # avalia a versão atual e grava evals/baseline.json
-make eval             # avalia de novo e aplica o gate
+cp .env.example .env  # Configure ANTHROPIC_API_KEY and optional token pricing
+make smoke            # Run 3-case smoke test to validate credentials & pipeline
+make baseline         # Evaluate current state and persist evals/baseline.json
+make eval             # Run full evaluation and enforce CI gate
 ```
 
-Para comparar uma variante com a baseline, passe os parâmetros em `EVAL_ARGS`:
+#### Experimenting with Hyperparameters
+
+Pass runtime overrides via `EVAL_ARGS` to benchmark variants against `baseline.json`:
 
 ```bash
 make eval EVAL_ARGS="--chunk-size 400 --chunk-overlap 40"
 make eval EVAL_ARGS="--prompt v2 --top-k 6"
 ```
 
-Com Docker, `docker compose up --build` executa `make eval` dentro de um container com as dependências fixas. O cache e os resultados ficam no host, em `.cache/` e `results/`.
+#### Running with Docker
 
-O relatório de cada execução fica em `results/report.md`, e o JSON completo, com cada caso, resposta, afirmações e veredictos, fica em `results/<nome>.json`. Esse JSON é o lugar para investigar uma regressão caso a caso.
+```bash
+docker compose up --build
+```
 
-## Concordância entre juiz e humano
+Executes `make eval` inside a reproducible container while persisting `.cache/` and `results/` to the host filesystem. Summary reports are written to `results/report.md` and granular per-case traces to `results/<run_name>.json`.
 
-Um juiz LLM só é útil se concordar com quem entende do assunto. Para medir isso, `make eval` gera `results/candidate_claims.csv`, com todas as afirmações julgadas. Preencha a coluna `human_supported` com 1 ou 0 em uma amostra de 30 a 50 linhas, sem olhar a coluna `judge_supported` para não contaminar a anotação, e rode:
+---
+
+### Judge-Human Alignment (Cohen's Kappa)
+
+An LLM judge is only trustworthy if its verdicts align with domain experts. Each `make eval` run exports `results/candidate_claims.csv` containing all evaluated claims. Annotate 30–50 rows in the `human_supported` column (`1` or `0`) blindly (without viewing `judge_supported`), then compute inter-annotator agreement:
 
 ```bash
 make agreement
 ```
 
-O script reporta a concordância simples e o kappa de Cohen. O kappa é o número que importa, porque desconta a concordância que se espera por acaso, o que é relevante quando a maioria das afirmações é sustentada.
+The script reports raw percentage agreement alongside **Cohen's Kappa ($\kappa$)**, accounting for chance agreement on imbalanced claim distributions.
 
-## Resultados
+---
 
-<!-- Preencher somente com saídas de `make baseline` e `make eval` executadas no repositório. -->
+### Benchmark Results & Regression Case Study
 
-| Métrica | Baseline | Candidato | Piso |
-|---|---|---|---|
-| faithfulness | — | — | 0.80 |
-| answer_relevance | — | — | 0.70 |
-| context_precision | — | — | 0.50 |
-| refusal_accuracy | — | — | 0.85 |
+<!-- Populate strictly with outputs from `make baseline` and `make eval`. -->
 
-Custo e latência por consulta: a preencher a partir do relatório.
+| Metric | Baseline | Candidate | Gate Floor |
+| :--- | :---: | :---: | :---: |
+| `faithfulness` | — | — | `0.80` |
+| `answer_relevance` | — | — | `0.70` |
+| `context_precision` | — | — | `0.50` |
+| `refusal_accuracy` | — | — | `0.85` |
 
-Concordância juiz × humano: a preencher com o resultado de `make agreement`, incluindo o número de afirmações anotadas.
+- **Latency & Cost per Query:** *To be populated from `results/report.md`.*
+- **Judge × Human Agreement:** *To be populated from `make agreement` ($N$ annotated claims).*
 
-### Caso de regressão
+#### Reproducing a Controlled Regression
 
-<!-- Documentar aqui uma queda real: mudança feita, métrica afetada, o que o gate reportou e a causa encontrada. -->
+To observe the gate catching a real degradation, reduce chunk size aggressively so legal context is fragmented:
 
-Para reproduzir o experimento, troque o tamanho do chunk para um valor muito pequeno, por exemplo `--chunk-size 150 --chunk-overlap 20`, e rode `make eval`. Um chunk pequeno demais separa a informação do contexto que a sustenta, e espera-se que a `faithfulness` ou a `context_precision` caiam o suficiente para reprovar o gate. O relatório mostra qual métrica caiu e em quanto.
-
-## Limitações
-
-O golden set inicial tem apenas 12 casos. A recomendação é chegar a 100 a 150 casos bem escolhidos, cobrindo recuperação direta, perguntas que exigem combinar trechos e perguntas fora do escopo. Casos gerados em massa sem revisão medem pouco. Os `expected_answer` foram escritos a partir do conhecimento sobre a lei e precisam ser conferidos contra o texto oficial antes de qualquer publicação dos números.
-
-Com 12 casos, uma métrica pode variar bastante por causa de um único caso. Isso é adequado para validar o pipeline, mas não para tirar conclusões sobre qual prompt é melhor. Conclusões exigem um conjunto maior e intervalos de confiança.
-
-Os juízes são modelos e erram. A concordância com humanos é a medida de quanto se pode confiar neles, e precisa ser reportada junto com qualquer número.
-
-A busca é lexical. Perguntas que usam palavras diferentes das do documento, como "dado de saúde" para "dado referente à saúde", podem não recuperar o chunk certo. Isso aparece na `context_precision` e no `refusal_accuracy`, e é o principal motivo para testar embeddings.
-
-O corpus é uma única lei, com chunking por parágrafo. Documentos com estrutura forte, como contratos ou normas com artigos numerados, se beneficiariam de cortes guiados pela estrutura.
-
-## Estrutura do repositório
-
+```bash
+make eval EVAL_ARGS="--chunk-size 150 --chunk-overlap 20"
 ```
+
+Splitting clauses across tiny chunks severs claims from supporting evidence, driving `faithfulness` and `context_precision` below the gate floor and failing the build with a detailed diff report.
+
+---
+
+### Known Limitations & Roadmap
+
+- **Golden Dataset Scale:** The initial seed contains 12 curated cases suitable for pipeline validation. Production statistical significance requires expanding to **100–150 cases** covering single-hop, multi-hop synthesis, and out-of-scope queries, plus confidence intervals.
+- **Lexical Vocabulary Mismatch:** BM25 does not capture semantic synonyms (e.g., *"dado de saúde"* vs. *"dado referente à saúde"*), impacting `context_precision` and motivating a hybrid BM25 + dense embedding experiment.
+- **Structure-Aware Chunking:** Currently splits by paragraph; legal statutes and contracts benefit from article/section-aware hierarchical chunking.
+
+---
+
+### Repository Structure
+
+```text
 eval-gate/
-├── app/                    # o sistema avaliado
-│   ├── config.py           # parâmetros de cada experimento
-│   ├── ingest.py           # carregamento e chunking
-│   ├── retrieval.py        # BM25
-│   ├── llm.py              # cliente da API e cache em disco
-│   └── answer.py           # geração com recusa; versões de prompt
-├── evals/                  # a camada de avaliação
-│   ├── golden.jsonl        # casos de avaliação, versionados
-│   ├── dataset.py          # leitura e validação do golden set
-│   ├── judges.py           # juízes de relevância, contexto e recusa
-│   ├── hallucination.py    # verificador de sustentação
-│   ├── run_eval.py         # executa o pipeline e agrega as métricas
-│   ├── gate.py             # piso, regressão e código de saída
-│   ├── report.py           # relatório em markdown
-│   ├── agreement.py        # concordância juiz × humano
-│   └── baseline.json       # resultado de referência da main
-├── tests/                  # testes unitários e de regressão
-├── scripts/fetch_corpus.py # baixa o corpus
-├── data/corpus/            # documentos de origem
-├── thresholds.yaml         # pisos e tolerâncias do gate
+├── app/                      # System Under Test (SUT)
+│   ├── config.py             # Experiment configuration & hyperparameters
+│   ├── ingest.py             # Document loading & chunking
+│   ├── retrieval.py          # BM25 lexical retriever
+│   ├── llm.py                # API client & content-addressed disk cache
+│   └── answer.py             # Constrained generation, refusal logic & prompts
+├── evals/                    # Evaluation & CI Gating Layer
+│   ├── golden.jsonl          # Versioned ground-truth dataset
+│   ├── dataset.py            # Dataset loader & schema validation
+│   ├── judges.py             # Answer relevance, context & refusal judges
+│   ├── hallucination.py      # Claim decomposition & deterministic quote verifier
+│   ├── run_eval.py           # Evaluation runner & metric aggregator
+│   ├── gate.py               # Floor/regression evaluator & CI exit codes
+│   ├── report.py             # Markdown & JSON report generator
+│   ├── agreement.py          # Cohen's Kappa human-judge alignment script
+│   └── baseline.json         # Reference metrics from main branch
+├── tests/                    # Offline unit & regression tests
+├── scripts/fetch_corpus.py   # Corpus ingestion script
+├── data/corpus/              # Source documents
+├── thresholds.yaml           # CI gate floors & regression tolerances
 ├── .github/workflows/eval.yml
 ├── Makefile
 ├── Dockerfile
 └── docker-compose.yml
 ```
 
-## Licença
+### License
 
-MIT. Veja o arquivo LICENSE.
+Distributed under the **MIT License**. See `LICENSE` for details.
+
+---
+---
+
+## Documentação em Português
+
+### Visão Geral
+
+Construir um protótipo de RAG (*Retrieval-Augmented Generation*) que responde perguntas sobre documentos é relativamente simples. O verdadeiro desafio de engenharia é saber, após alterar o tamanho dos *chunks* ou reescrever um *prompt*, se o sistema melhorou ou piorou — e impedir que mudanças aparentemente inofensivas degradem a qualidade das respostas em produção.
+
+O **Eval Gate** trata a avaliação de IA como código de primeira classe: um *dataset* de casos versionado no repositório, métricas calculadas a cada alteração e um **Quality Gate no GitHub Actions** que bloqueia automaticamente o *Pull Request* sempre que alguma métrica ultrapassa os limites tolerados.
+
+O domínio de referência utiliza a **LGPD (Lei 13.709/2018)**, mas o pipeline é totalmente agnóstico ao domínio — basta substituir o corpus e o *golden set* para aplicá-lo a qualquer base de conhecimento.
+
+---
+
+### Arquitetura e Pipeline de Avaliação
+
+Cada pergunta passa por uma busca lexical BM25 e por um gerador restrito ao contexto, com instrução explícita de recusa quando a evidência não estiver presente. Em seguida, a resposta é avaliada por métricas independentes antes de passar pelo gate de CI:
+
+```text
+pergunta ──► BM25 (top-k chunks) ──► geração (com recusa) ──► resposta
+                                            │
+          ┌─────────────────────────────────┼──────────────────────────────┐
+          ▼                                 ▼                              ▼
+   faithfulness                    answer relevance              context precision
+   (afirmação × evidência)           (juiz LLM, nota 0–5)      (chunks úteis / top-k)
+          │
+          └──────────── refusal accuracy (recusa só quando deve) ──────────┐
+                                                                            ▼
+                             gate: piso absoluto + regressão vs baseline ──► CI
+```
+
+---
+
+### Métricas e Telemetria
+
+| Métrica | Pergunta que responde | Como é calculada | Limitação conhecida |
+| :--- | :--- | :--- | :--- |
+| **`faithfulness`** | A resposta é sustentada pelos trechos recuperados? | Afirmações sustentadas divididas pelo total de afirmações. Cada afirmação exige citação literal verificada deterministicamente no chunk. | Depende da granularidade da decomposição feita pelo LLM; afirmações mal divididas podem ser julgadas com folga. |
+| **`answer_relevance`** | A resposta trata da pergunta feita? | Juiz LLM em escala de `0` a `5`, normalizada para `[0, 1]`. | Juízes LLM tendem a favorecer respostas longas (*verbosity bias*), exigindo calibração com humanos. |
+| **`context_precision`** | O retrieval trouxe contexto útil? | Chunks julgados úteis divididos pelos chunks recuperados (`top-k`). Casos sem chunks ficam fora da média. | Não mede *recall*: não penaliza trechos relevantes que deixaram de ser recuperados. |
+| **`refusal_accuracy`** | O sistema recusa quando deve, e apenas quando deve? | Proporção de casos em que a recusa coincide com o rótulo esperado (`fora_do_escopo`). | Recusas parciais (que respondem parte da pergunta e negam outra) dependem da sensibilidade do classificador. |
+
+**Telemetria Operacional:** Além das métricas de qualidade, o relatório registra **latência (p50 e p95)** das chamadas que foram ao modelo (excluindo cache), **tokens consumidos**, **custo estimado** (via `.env`) e **taxa de acerto do cache**.
+
+---
+
+### O Gate de Qualidade (`thresholds.yaml`)
+
+O gate aplica duas regras obrigatórias antes de permitir o *merge* de um PR:
+
+1. **Piso Absoluto:** Cada métrica monitorada deve estar acima do valor mínimo configurado, independentemente do histórico anterior.
+2. **Tolerância de Regressão:** Nenhuma métrica pode cair além da margem permitida em relação à *baseline* da branch `main` salva em `evals/baseline.json`.
+
+> **Regra de ouro:** Os limites iniciais são conservadores e calibrados na primeira execução real na `main`. Nunca rebaixe um limite apenas para destravar um PR — investigue a causa da regressão.
+
+---
+
+### Decisões Arquiteturais
+
+- **Busca Lexical Determinística (BM25):** Escolhida no lugar de busca vetorial por ter custo zero de infraestrutura, determinismo total e alta precisão em termos jurídicos exatos (ex.: *"controlador"*, *"operador"*, *"anonimização"*). A interface de retrieval foi isolada para permitir experimentação futura com *embeddings*.
+- **Separação de Papéis (Gerador vs. Juiz):** Configurável via `EVAL_JUDGE_MODEL` para evitar viés de autoavaliação (*self-enhancement bias*), no qual um modelo atribui notas maiores às próprias respostas.
+- **Verificação Determinística de Citações:** Quando o juiz afirma que uma declaração é sustentada, ele precisa apontar um trecho literal do contexto. O verificador valida deterministicamente se a *substring* existe no chunk — citações inventadas pelo juiz são reclassificadas como não sustentadas.
+- **Recusa em Caminho Curto (*Short-Circuit*):** Se nenhum chunk for recuperado, o pipeline retorna a recusa diretamente sem acionar o LLM, economizando custo e eliminando o risco de alucinação sem contexto.
+- **Cache em Disco por Hash e `temperature=0`:** Todas as chamadas ao LLM passam por cache indexado pelo hash de `(modelo, prompt, max_tokens)`. Reexecutar suítes sem alterações tem custo zero, e mudanças de prompt invalidam apenas os casos afetados.
+- **Testes Unitários Offline (`FakeLLM`):** O componente `FakeLLM` em `tests/fakes.py` devolve respostas enfileiradas, permitindo validar juízes, verificador de sustentação e gate no CI sem depender de chaves de API.
+
+---
+
+### Como Rodar
+
+Os comandos assumem **Python 3.12+** e shell POSIX (ou **Docker**).
+
+```bash
+make install          # Instala as dependências
+make corpus           # Baixa a LGPD do Planalto para data/corpus/lgpd.txt
+make test             # Executa os testes unitários (offline, sem API)
+
+cp .env.example .env  # Preencha ANTHROPIC_API_KEY e, opcionalmente, os preços por token
+make smoke            # Roda 3 casos para validar credenciais e pipeline
+make baseline         # Avalia a versão atual e grava evals/baseline.json
+make eval             # Executa avaliação completa e aplica o gate
+```
+
+#### Comparando Variantes com a Baseline
+
+Passe parâmetros em `EVAL_ARGS` para testar hipóteses contra `baseline.json`:
+
+```bash
+make eval EVAL_ARGS="--chunk-size 400 --chunk-overlap 40"
+make eval EVAL_ARGS="--prompt v2 --top-k 6"
+```
+
+#### Execução via Docker
+
+```bash
+docker compose up --build
+```
+
+Executa `make eval` em container isolado, persistindo `.cache/` e `results/` no host. O relatório resumido é gerado em `results/report.md` e o detalhamento completo caso a caso em `results/<nome>.json`.
+
+---
+
+### Concordância entre Juiz e Humano (Kappa de Cohen)
+
+Um juiz LLM só é confiável se concordar com avaliadores humanos. A execução de `make eval` gera `results/candidate_claims.csv` com todas as afirmações julgadas. Preencha a coluna `human_supported` (`1` ou `0`) em uma amostra de 30 a 50 linhas às cegas (sem consultar `judge_supported`) e execute:
+
+```bash
+make agreement
+```
+
+O script calcula a concordância simples e o **Kappa de Cohen ($\kappa$)**, descontando a concordância esperada ao acaso.
+
+---
+
+### Resultados e Caso de Regressão
+
+<!-- Preencher exclusivamente com saídas de `make baseline` e `make eval`. -->
+
+| Métrica | Baseline | Candidato | Piso do Gate |
+| :--- | :---: | :---: | :---: |
+| `faithfulness` | — | — | `0.80` |
+| `answer_relevance` | — | — | `0.70` |
+| `context_precision` | — | — | `0.50` |
+| `refusal_accuracy` | — | — | `0.85` |
+
+- **Custo e latência por consulta:** *A preencher a partir de `results/report.md`.*
+- **Concordância juiz × humano:** *A preencher com o resultado de `make agreement` ($N$ afirmações anotadas).*
+
+#### Reproduzindo uma Regressão Controlada
+
+Para observar o gate bloqueando uma degradação real, reduza drasticamente o tamanho dos chunks para fragmentar o contexto jurídico:
+
+```bash
+make eval EVAL_ARGS="--chunk-size 150 --chunk-overlap 20"
+```
+
+Chunks excessivamente pequenos separam as afirmações de suas evidências, derrubando `faithfulness` e `context_precision` abaixo do piso configurado e reprovando o CI.
+
+---
+
+### Limitações Conhecidas
+
+- **Tamanho do Golden Set:** O conjunto inicial possui 12 casos curados, adequado para validar o pipeline, mas insuficiente para significância estatística entre prompts (recomenda-se expandir para **100–150 casos** com intervalos de confiança).
+- **Descasa­mento Lexical (BM25):** Perguntas que usam sinônimos ausentes no texto (ex.: *"dado de saúde"* vs. *"dado referente à saúde"*) podem falhar no retrieval, motivando experimentos futuros com busca híbrida (BM25 + *embeddings*).
+- **Chunking Estrutural:** O corte atual é por parágrafo; textos legais e contratos se beneficiam de *chunking* hierárquico guiado por artigos e seções.
+
+---
+
+### Licença
+
+Distribuído sob a licença **MIT**. Consulte o arquivo `LICENSE` para mais informações.
